@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""
+HoloRAID v3.0 (HyperMorphic Gearbox) — Intricate Image Reconstruction Benchmark
+------------------------------------------------------------------------------
+
+What this does:
+- Generates a highly intricate 16-bit grayscale image (fractal + interference + rings).
+- Encodes every pixel as a secret s ∈ [0, Q] using CORRECT Asmuth–Bloom (shadow prime p0 > Q).
+- Splits into n shards, then simulates shard loss (up to n-k erasures).
+- Decodes from any k shards and verifies BIT-PERFECT reconstruction.
+
+Colab:
+- Paste this whole file into a single cell and run.
+- No installs needed (NumPy + Matplotlib are preinstalled on Colab).
+
+Notes on correctness:
+- Uses a sequential (Garner-style) CRT lift that stays within int64 range for k=3,
+  avoiding uint64 overflow that breaks "vectorized CRT sum-of-products" methods.
+
+Authors: Shaun Gerrard + Claude (HyperMorphic Mathematics Research)
+Date: 2026-01-03
+"""
+
+import math
+import time
+import random
+from dataclasses import dataclass
+from functools import reduce
+from typing import List, Tuple, Dict
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# =========================
+# Utilities
+# =========================
+
+def gcd(a: int, b: int) -> int:
+    while b:
+        a, b = b, a % b
+    return a
+
+def extended_gcd(a: int, b: int):
+    if a == 0:
+        return (b, 0, 1)
+    g, x, y = extended_gcd(b % a, a)
+    return (g, y - (b // a) * x, x)
+
+def mod_inverse(a: int, m: int) -> int:
+    g, x, _ = extended_gcd(a % m, m)
+    if g != 1:
+        raise ValueError(f"No modular inverse for {a} mod {m}")
+    return x % m
+
+def is_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    if n in (2, 3):
+        return True
+    if n % 2 == 0:
+        return False
+    # deterministic MR for 64-bit-ish range (fine for our sizes)
+    r, d = 0, n - 1
+    while d % 2 == 0:
+        r += 1
+        d //= 2
+    for a in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if a >= n:
+            continue
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(r - 1):
+            x = (x * x) % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+def next_prime(n: int) -> int:
+    if n <= 2:
+        return 2
+    if n % 2 == 0:
+        n += 1
+    while not is_prime(n):
+        n += 2
+    return n
+
+
+# =========================
+# HyperMorphic Gearbox (Φ, Ψ, ε_h)
+# =========================
+
+@dataclass
+class HyperMorphicGearbox:
+    Q: int = 65535
+    n: int = 5
+    k: int = 3
+    phi_seed: int = 1337      # Φ: wiring seed
+    eps_h: int = 1            # ε_h: no-zero shift
+    psi_prime_start: int = None  # Ψ: prime generator start (default Q+1)
+
+    def __post_init__(self):
+        if self.psi_prime_start is None:
+            self.psi_prime_start = self.Q + 1
+
+        # Ψ: choose shadow prime p0 > Q
+        self.p0 = next_prime(self.psi_prime_start)  # for Q=65535 => 65537
+
+        # Ψ: choose sharing primes strictly above p0
+        primes = []
+        cand = self.p0 + 1
+        while len(primes) < self.n:
+            p = next_prime(cand)
+            primes.append(p)
+            cand = p + 1
+        self.primes = primes
+
+        # Asmuth–Bloom sanity
+        sorted_primes = sorted(self.primes)
+        self.M_k = reduce(lambda a, b: a * b, sorted_primes[: self.k], 1)
+        self.M_km1 = reduce(lambda a, b: a * b, sorted_primes[: self.k - 1], 1) if self.k > 1 else 1
+        if self.p0 * self.M_km1 >= self.M_k:
+            raise ValueError("Asmuth–Bloom condition failed (p0*M_{k-1} >= M_k).")
+
+        self.max_r = (self.M_k - self.Q - 1) // self.p0
+
+        # Φ: deterministic shard routing permutation
+        rng = np.random.default_rng(self.phi_seed)
+        self.route_perm = rng.permutation(self.n).tolist()
+        self.unroute_perm = [0] * self.n
+        for i, j in enumerate(self.route_perm):
+            # original index i goes to routed position j
+            self.unroute_perm[j] = i
+
+    def info(self) -> str:
+        return (
+            "HyperMorphic Gearbox\n"
+            f"  Q={self.Q}, n={self.n}, k={self.k}\n"
+            f"  ε_h={self.eps_h}, Φ(seed)={self.phi_seed}\n"
+            f"  shadow prime p0={self.p0} (must be > Q)\n"
+            f"  sharing primes={self.primes}\n"
+            f"  M_k={self.M_k}\n"
+            f"  max_r={self.max_r}\n"
+            f"  route_perm={self.route_perm}\n"
+        )
+
+
+# =========================
+# Garner-style sequential CRT for arrays (avoids overflow)
+# =========================
+
+def crt_lift_sequential(residues: List[np.ndarray], moduli: List[int]) -> np.ndarray:
+    """
+    Vectorized sequential CRT (Garner-like):
+        x ≡ r0 (mod m0)
+        x ≡ r1 (mod m1)
+        ...
+    Maintains x in [0, M) where M is product of used moduli.
+    For k=3 with ~65k primes, everything stays safely within int64.
+    """
+    if len(residues) != len(moduli):
+        raise ValueError("residues/moduli length mismatch")
+
+    # Work in int64 (safe for our parameter sizes)
+    x = residues[0].astype(np.int64)
+    M = np.int64(moduli[0])
+
+    for j in range(1, len(moduli)):
+        mj = np.int64(moduli[j])
+        inv = np.int64(mod_inverse(int(M % mj), int(mj)))  # inv(M mod mj) mod mj
+
+        # t = ((rj - x) * inv) mod mj
+        diff = (residues[j].astype(np.int64) - x) % mj
+        t = (diff * inv) % mj
+
+        x = x + t * M
+        M = M * mj
+        x %= M
+
+    return x.astype(np.int64)
+
+
+# =========================
+# Asmuth–Bloom image encode/decode (vectorized)
+# =========================
+
+def encode_image_asmuth_bloom(img_u16: np.ndarray, gear: HyperMorphicGearbox, rng: np.random.Generator):
+    """
+    Returns shards in routed order, dtype uint32 with values < p_i.
+    """
+    Q, p0 = gear.Q, gear.p0
+    primes = gear.primes
+
+    # Secrets s ∈ [0,Q]
+    s = img_u16.astype(np.uint32)
+
+    # ε_h shift (no-zero / dead-zone avoidance), keep in [0,Q]
+    s_adj = (s + gear.eps_h) % (Q + 1)
+
+    # Randomness r per pixel (uniform)
+    r = rng.integers(0, gear.max_r + 1, size=s.shape, dtype=np.uint64)
+
+    # Lift s' = s_adj + r*p0  (uint64)
+    s_prime = s_adj.astype(np.uint64) + r * np.uint64(p0)
+
+    # Shard: share_i = s' mod p_i
+    shards = []
+    for p in primes:
+        shards.append((s_prime % np.uint64(p)).astype(np.uint32))
+
+    # Route shards through Φ wiring
+    routed = [None] * gear.n
+    for orig_i, routed_pos in enumerate(gear.route_perm):
+        routed[routed_pos] = shards[orig_i]
+
+    return routed
+
+
+def decode_image_asmuth_bloom(routed_shards: List[np.ndarray], kept_indices: List[int], gear: HyperMorphicGearbox):
+    """
+    Decode from any k routed shards (kept_indices are routed positions).
+    """
+    if len(kept_indices) != gear.k:
+        raise ValueError("Need exactly k kept shards")
+
+    # Unroute: map routed positions back to original prime indices
+    orig_indices = [gear.unroute_perm[i] for i in kept_indices]
+
+    residues = [routed_shards[ri] for ri in kept_indices]
+    moduli = [gear.primes[oi] for oi in orig_indices]
+
+    # Sequential CRT lift to recover s' modulo product(moduli)
+    s_prime = crt_lift_sequential(residues, moduli).astype(np.int64)
+
+    # Recover secret: s = (s' mod p0) - ε_h  (then wrap to [0,Q])
+    s_mod = (s_prime % gear.p0).astype(np.int64)
+    s_rec = (s_mod - gear.eps_h) % (gear.Q + 1)
+
+    return s_rec.astype(np.uint16)
+
+
+# =========================
+# Intricate image generator (fractal + interference)
+# =========================
+
+def generate_intricate_image(H=768, W=768, iters=220, seed=7) -> np.ndarray:
+    """
+    Produces a rich 16-bit grayscale field:
+    - Mandelbrot escape-time texture
+    - Multi-frequency interference
+    - Radial rings + angle shear
+    """
+    rng = np.random.default_rng(seed)
+
+    # Complex plane grid
+    xs = np.linspace(-2.2, 1.1, W, dtype=np.float64)
+    ys = np.linspace(-1.6, 1.6, H, dtype=np.float64)
+    X, Y = np.meshgrid(xs, ys)
+    C = X + 1j * Y
+
+    Z = np.zeros_like(C)
+    esc = np.zeros((H, W), dtype=np.float64)
+    mask = np.ones((H, W), dtype=bool)
+
+    # Mandelbrot iterations (vectorized)
+    for i in range(iters):
+        Z[mask] = Z[mask] * Z[mask] + C[mask]
+        m = np.abs(Z) > 2.0
+        newly = m & mask
+        # Smooth escape time
+        esc[newly] = i + 1 - np.log2(np.log(np.abs(Z[newly]) + 1e-12))
+        mask &= ~m
+        if not mask.any():
+            break
+
+    esc[mask] = iters  # inside set
+
+    # Normalize escape texture
+    esc_norm = (esc - esc.min()) / (esc.max() - esc.min() + 1e-12)
+
+    # Interference field (primes as periods)
+    primes = np.array([31, 37, 41, 43, 47, 53, 59], dtype=np.float64)
+    phase = rng.random(primes.shape[0]) * 2 * np.pi
+    amp = rng.normal(0, 1, primes.shape[0]) * 0.12
+
+    # Use pixel coords as "x"
+    u = (np.arange(W, dtype=np.float64)[None, :] / W) * 2 * np.pi
+    v = (np.arange(H, dtype=np.float64)[:, None] / H) * 2 * np.pi
+    base = 0.55 * esc_norm + 0.45 * (0.5 + 0.5 * np.sin(3*u + 2*v))
+
+    inter = np.zeros((H, W), dtype=np.float64)
+    for a, p, ph in zip(amp, primes, phase):
+        inter += a * np.sin((2 * np.pi / p) * (X * 200 + Y * 160) + ph)
+
+    # Radial / angular geometry
+    R = np.sqrt(X*X + Y*Y)
+    A = np.arctan2(Y, X)
+    rings = 0.35 * (0.5 + 0.5 * np.cos(18 * R + 2.7 * np.sin(5*A)))
+    shear = 0.25 * (0.5 + 0.5 * np.sin(7*A + 9*R))
+
+    field = base + inter + rings + shear
+    field = (field - field.min()) / (field.max() - field.min() + 1e-12)
+
+    # Quantize to 16-bit
+    img = np.clip(np.round(field * 65535.0), 0, 65535).astype(np.uint16)
+    return img
+
+
+# =========================
+# Benchmark runner
+# =========================
+
+def run_intricate_image_benchmark(
+    H=768, W=768,
+    n=5, k=3,
+    max_erasures=2,
+    trials=12,
+    Q=65535,
+    phi_seed=1337,
+    eps_h=1,
+    image_iters=220
+):
+    assert n == 5 and k == 3, "This benchmark is tuned for k=3-of-5 (fast & safe)."
+
+    gear = HyperMorphicGearbox(Q=Q, n=n, k=k, phi_seed=phi_seed, eps_h=eps_h)
+    print("═" * 80)
+    print("HoloRAID v3.0 (HyperMorphic Gearbox) — Intricate Image Reconstruction Benchmark")
+    print("═" * 80)
+    print(gear.info())
+
+    # Generate intricate image
+    t0 = time.time()
+    img = generate_intricate_image(H=H, W=W, iters=image_iters, seed=7)
+    t_img = time.time() - t0
+    print(f"Generated intricate image {H}x{W} in {t_img:.3f}s (iters={image_iters})")
+
+    rng = np.random.default_rng(42)
+
+    # Encode
+    t0 = time.time()
+    shards = encode_image_asmuth_bloom(img, gear, rng)
+    t_enc = time.time() - t0
+    print(f"Encoded image into {n} shards in {t_enc:.3f}s")
+    print(f"Shard dtype={shards[0].dtype}, shard value range ~ [0, max(p_i))")
+
+    # Quick sanity: decode with all shards kept (choose first k)
+    kept = list(range(n))[:k]
+    rec0 = decode_image_asmuth_bloom(shards, kept, gear)
+    ok0 = np.array_equal(rec0, img)
+    print("PASS" if ok0 else "FAIL")
+    if not ok0:
+        diff = np.abs(rec0.astype(np.int64) - img.astype(np.int64))
+        print(f"  kept indices: {kept}")
+        print(f"  max abs diff: {diff.max()}")
+        raise AssertionError("Initial reconstruction failed (should be perfect).")
+
+    # Trials under erasures
+    perfect = 0
+    decode_times = []
+    for t in range(trials):
+        er = rng.integers(0, max_erasures + 1)
+        # pick k kept out of n-er
+        kept_pool = np.arange(n)
+        if er > 0:
+            drop = rng.choice(kept_pool, size=er, replace=False)
+            kept_pool = np.array([i for i in kept_pool if i not in set(drop)])
+        kept_idx = rng.choice(kept_pool, size=k, replace=False).tolist()
+
+        tt = time.time()
+        rec = decode_image_asmuth_bloom(shards, kept_idx, gear)
+        decode_times.append(time.time() - tt)
+
+        if np.array_equal(rec, img):
+            perfect += 1
+        else:
+            diff = np.abs(rec.astype(np.int64) - img.astype(np.int64))
+            print("FAIL TRIAL")
+            print(f"  erasures: {er}")
+            print(f"  kept indices: {kept_idx}")
+            print(f"  max abs diff: {diff.max()}")
+            raise AssertionError("Reconstruction was not bit-perfect.")
+
+    decode_times = np.array(decode_times)
+    print("─" * 80)
+    print(f"Trials: {trials}")
+    print(f"Max erasures tested: {max_erasures} (n={n}, k={k}, so n-k={n-k})")
+    print(f"Perfect reconstructions: {perfect}/{trials} ({100*perfect/trials:.1f}%)")
+    print(f"Decode time: mean={decode_times.mean():.4f}s, p95={np.percentile(decode_times,95):.4f}s")
+    print("─" * 80)
+    print("✓ Bit-perfect intricate image reconstruction verified under shard loss.")
+
+    # Save figure
+    fig = plt.figure(figsize=(12, 4), dpi=160)
+    ax1 = plt.subplot(1, 3, 1); ax1.set_title("Original (16-bit)"); ax1.axis("off")
+    ax2 = plt.subplot(1, 3, 2); ax2.set_title(f"Reconstructed (k={k})"); ax2.axis("off")
+    ax3 = plt.subplot(1, 3, 3); ax3.set_title("|Diff|"); ax3.axis("off")
+
+    ax1.imshow(img, cmap="gray", vmin=0, vmax=65535)
+    ax2.imshow(rec0, cmap="gray", vmin=0, vmax=65535)
+    ax3.imshow(np.abs(rec0.astype(np.int64) - img.astype(np.int64)), cmap="gray")
+
+    plt.tight_layout()
+    out = "holoraid_v3_hm_intricate_image_reconstruction.png"
+    plt.savefig(out, bbox_inches="tight")
+    plt.show()
+    print(f"Saved: {out}")
+
+    return gear, shards, img, rec0
+
+
+if __name__ == "__main__":
+    run_intricate_image_benchmark(
+        H=768, W=768,
+        n=5, k=3,
+        max_erasures=2,
+        trials=12,
+        Q=65535,
+        phi_seed=1337,
+        eps_h=1,
+        image_iters=220
+    )
+
+
+════════════════════════════════════════════════════════════════════════════════
+HoloRAID v3.0 (HyperMorphic Gearbox) — Intricate Image Reconstruction Benchmark
+════════════════════════════════════════════════════════════════════════════════
+HyperMorphic Gearbox
+  Q=65535, n=5, k=3
+  ε_h=1, Φ(seed)=1337
+  shadow prime p0=65537 (must be > Q)
+  sharing primes=[65539, 65543, 65551, 65557, 65563]
+  M_k=281582362100027
+  max_r=4296540306
+  route_perm=[3, 2, 4, 0, 1]
+
+Generated intricate image 768x768 in 2.297s (iters=220)
+Encoded image into 5 shards in 0.106s
+Shard dtype=uint32, shard value range ~ [0, max(p_i))
+PASS
+────────────────────────────────────────────────────────────────────────────────
+Trials: 12
+Max erasures tested: 2 (n=5, k=3, so n-k=2)
+Perfect reconstructions: 12/12 (100.0%)
+Decode time: mean=0.1249s, p95=0.1452s
+────────────────────────────────────────────────────────────────────────────────
+✓ Bit-perfect intricate image reconstruction verified under shard loss.
+
+Saved: holoraid_v3_hm_intricate_image_reconstruction.png
+
