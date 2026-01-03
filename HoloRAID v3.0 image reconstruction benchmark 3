@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""
+════════════════════════════════════════════════════════════════════════════════
+HoloRAID v3.0 (HyperMorphic Gearbox) — 6-of-10 Image Reconstruction Benchmark
+════════════════════════════════════════════════════════════════════════════════
+
+What this is:
+- k-of-n CRT erasure coding + Asmuth–Bloom-style secrecy lift
+- Vectorized NumPy implementation (Colab-friendly)
+- Bit-perfect reconstruction of a high-res, highly-structured 16-bit image
+  under up to (n-k) shard erasures.
+
+Key HyperMorphic "Gearbox" knobs (lightweight + deterministic):
+- Ψ: prime selection (shadow prime p0 and sharing primes p_i > p0)
+- Φ: deterministic routing permutation ("configuration signature")
+- ε_h: no-zero shift (keeps secrets off the dead zone before lift/CRT reduce)
+
+Secrecy note:
+- Asmuth–Bloom uses a random lift s' = (s + ε_h) + r·p0 and shares s' mod p_i.
+- Here we sample r as 64-bit randomness *per pixel* (fast; still enormous).
+  For strict information-theoretic Asmuth–Bloom secrecy you would sample r
+  uniformly up to max_r (huge for 6-of-10); that requires big-int sampling
+  and is much slower. Decode is unchanged.
+
+Colab usage:
+1) Create a new notebook
+2) Paste this entire file into a cell
+3) Run the cell
+
+Requires: NumPy + Matplotlib (preinstalled on Colab).
+"""
+
+import math
+from functools import reduce
+from typing import List, Tuple, Dict, Optional
+
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+
+
+# =============================================================================
+# Math primitives
+# =============================================================================
+
+def gcd(a: int, b: int) -> int:
+    while b:
+        a, b = b, a % b
+    return a
+
+def extended_gcd(a: int, b: int) -> Tuple[int, int, int]:
+    """Returns (g, x, y) where ax + by = g = gcd(a,b)."""
+    if a == 0:
+        return b, 0, 1
+    g, x, y = extended_gcd(b % a, a)
+    return g, y - (b // a) * x, x
+
+def mod_inverse(a: int, m: int) -> int:
+    g, x, _ = extended_gcd(a % m, m)
+    if g != 1:
+        raise ValueError(f"No modular inverse for {a} mod {m}")
+    return x % m
+
+def is_prime(n: int) -> bool:
+    """Deterministic Miller-Rabin for 64-bit-ish sizes (more than enough here)."""
+    if n < 2:
+        return False
+    small = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
+    if n in small:
+        return True
+    for p in small:
+        if n % p == 0:
+            return False
+
+    # write n-1 = 2^r * d
+    d = n - 1
+    r = 0
+    while d % 2 == 0:
+        r += 1
+        d //= 2
+
+    for a in small:
+        if a >= n:
+            continue
+        x = pow(a, d, n)
+        if x == 1 or x == n - 1:
+            continue
+        witness_ok = False
+        for _ in range(r - 1):
+            x = (x * x) % n
+            if x == n - 1:
+                witness_ok = True
+                break
+        if not witness_ok:
+            return False
+    return True
+
+def next_prime(n: int) -> int:
+    if n <= 2:
+        return 2
+    if n % 2 == 0:
+        n += 1
+    while not is_prime(n):
+        n += 2
+    return n
+
+
+# =============================================================================
+# Ψ: Prime schedule (shadow prime + sharing primes)
+# =============================================================================
+
+def psi_prime_schedule(Q: int, n: int) -> Tuple[int, List[int]]:
+    """
+    Shadow prime p0 must be > Q so secrets s in [0,Q] satisfy s < p0.
+    Sharing primes p_i must be strictly increasing and > p0.
+    """
+    p0 = next_prime(Q + 1)
+    primes = []
+    cand = p0 + 1
+    while len(primes) < n:
+        p = next_prime(cand)
+        primes.append(p)
+        cand = p + 1
+    return p0, primes
+
+def asmuth_bloom_condition(p0: int, primes: List[int], k: int) -> Tuple[bool, int, int]:
+    """Check p0 * product(k-1 smallest primes) < product(k smallest primes)."""
+    ps = sorted(primes)
+    Mk = 1
+    for p in ps[:k]:
+        Mk *= p
+    Mk_1 = 1
+    for p in ps[:k-1]:
+        Mk_1 *= p
+    return (p0 * Mk_1 < Mk), Mk_1, Mk
+
+
+# =============================================================================
+# Φ: Deterministic routing permutation
+# =============================================================================
+
+def phi_route_perm(seed: int, n: int) -> Tuple[List[int], List[int]]:
+    """
+    Returns:
+    - perm: physical_shard_index -> prime_index
+    - inv_perm: prime_index -> physical_shard_index
+    """
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n).tolist()
+    inv = [0] * n
+    for phys_i, prime_i in enumerate(perm):
+        inv[prime_i] = phys_i
+    return perm, inv
+
+
+# =============================================================================
+# CRT decode ONLY modulo p0 (fast, avoids huge integer products)
+# =============================================================================
+
+def crt_reconstruct_mod_p0(
+    residues: List[np.ndarray],
+    moduli: List[int],
+    p0: int,
+) -> np.ndarray:
+    """
+    Canonical CRT reconstruction reduced mod p0 using an incremental Garner-style build.
+
+    We incorporate congruences one-by-one:
+      x = r0
+      M = m0
+      for i=1..k-1:
+        t = (r_i - x) * inv(M mod m_i) (mod m_i)
+        x = x + t*M
+        M = M*m_i
+
+    We never materialize big integers:
+      - we track x modulo each *future* modulus (arrays) so we can compute (r_i - x) mod m_i
+      - we track x modulo p0 (array) for the final answer
+      - all "M mod m_j" values are scalars (small), updated incrementally
+    """
+    k = len(moduli)
+    if len(residues) != k:
+        raise ValueError("residues and moduli length mismatch")
+    if k == 0:
+        raise ValueError("empty system")
+
+    m = [int(x) for x in moduli]
+    p0_int = int(p0)
+
+    # Arrays
+    r0 = residues[0].astype(np.uint64)
+
+    # x modulo each modulus (arrays) for future steps
+    x_mods = [None] * k
+    for j in range(k):
+        x_mods[j] = (r0 % np.uint64(m[j])).astype(np.uint64)
+
+    # x modulo p0 (array)
+    x_mod_p0 = (r0 % np.uint64(p0_int)).astype(np.uint64)
+
+    # M mod each modulus (scalars). Initially M = m0.
+    M_mods = [0] * k
+    for j in range(1, k):
+        M_mods[j] = m[0] % m[j]
+
+    # M mod p0 (scalar)
+    M_mod_p0 = m[0] % p0_int
+
+    for i in range(1, k):
+        mi = m[i]
+        ri = residues[i].astype(np.uint64)
+
+        Mi_mod_mi = M_mods[i]
+        inv = mod_inverse(Mi_mod_mi, mi)
+
+        diff = (ri + np.uint64(mi) - (x_mods[i] % np.uint64(mi))) % np.uint64(mi)
+        t = (diff * np.uint64(inv)) % np.uint64(mi)
+
+        # Update x mod p0
+        x_mod_p0 = (x_mod_p0 + (t % np.uint64(p0_int)) * np.uint64(M_mod_p0)) % np.uint64(p0_int)
+
+        # Update x mod all remaining moduli
+        for j in range(i + 1, k):
+            mj = m[j]
+            x_mods[j] = (x_mods[j] + (t % np.uint64(mj)) * np.uint64(M_mods[j])) % np.uint64(mj)
+
+        # Advance M for future steps: M *= mi  (tracked mod each remaining modulus + mod p0)
+        M_mod_p0 = (M_mod_p0 * (mi % p0_int)) % p0_int
+        for j in range(i + 1, k):
+            mj = m[j]
+            M_mods[j] = (M_mods[j] * (mi % mj)) % mj
+
+    return x_mod_p0
+
+
+# =============================================================================
+# Ultra-complex, high-res 16-bit image generator (deterministic)
+# =============================================================================
+
+def generate_ultra_image(H: int, W: int, Q: int, seed: int = 2026) -> np.ndarray:
+    """
+    Produces a structured 16-bit grayscale image with lots of geometry:
+    - polar interference
+    - starburst angular harmonics
+    - moiré bands
+    - concentric rings + checker warp
+    - fractal-ish feedback pass (one-step)
+    """
+    rng = np.random.default_rng(seed)
+
+    y = np.linspace(-1.0, 1.0, H, dtype=np.float64)
+    x = np.linspace(-1.0, 1.0, W, dtype=np.float64)
+    X, Y = np.meshgrid(x, y)
+    R = np.sqrt(X * X + Y * Y) + 1e-12
+    T = np.arctan2(Y, X)
+
+    # Multi-frequency holographic interference
+    freqs_r = np.array([7.0, 11.0, 19.0, 29.0, 41.0], dtype=np.float64)
+    freqs_t = np.array([5.0, 9.0, 13.0, 17.0], dtype=np.float64)
+
+    phase_r = rng.random(len(freqs_r)) * 2 * np.pi
+    phase_t = rng.random(len(freqs_t)) * 2 * np.pi
+
+    I = np.zeros((H, W), dtype=np.float64)
+
+    for f, ph in zip(freqs_r, phase_r):
+        I += np.sin(2 * np.pi * f * R + ph)
+
+    for f, ph in zip(freqs_t, phase_t):
+        I += 0.8 * np.sin(f * T + ph)
+
+    # Moiré banding (cartesian)
+    I += 0.6 * np.sin(2 * np.pi * (17.0 * X + 13.0 * Y))
+    I += 0.6 * np.sin(2 * np.pi * (19.0 * X - 11.0 * Y))
+
+    # Concentric rings + starburst gating
+    rings = np.cos(2 * np.pi * (35.0 * R)) * np.exp(-1.6 * R)
+    star = np.cos(12.0 * T) * np.exp(-0.8 * R)
+    I += 1.2 * rings * (0.6 + 0.4 * star)
+
+    # Checker warp with angular twist
+    warp = np.sin(2 * np.pi * (8.0 * X + 0.25 * np.sin(9.0 * T))) * np.sin(
+        2 * np.pi * (8.0 * Y + 0.25 * np.cos(7.0 * T))
+    )
+    I += 0.9 * warp
+
+        # Log-spiral lattice + triangular wave quantization
+    spiral = np.sin(2 * np.pi * (18.0 * np.log(R) + 3.0 * T))
+    tri = (2.0 / np.pi) * np.arcsin(np.sin(2 * np.pi * (10.0 * X - 7.0 * Y)))
+    I += 0.55 * spiral * np.exp(-0.9 * R) + 0.35 * tri
+
+    # Hex angular comb (soft)
+    hexcomb = np.cos(6.0 * T + 14.0 * R) * np.exp(-1.1 * R)
+    I += 0.45 * hexcomb
+
+# Fractal-ish feedback: one iteration of nonlinear remap
+    I2 = np.sin(I) + 0.35 * np.sin(3 * I + 2 * np.pi * R) + 0.15 * np.cos(5 * I + 3 * T)
+    I = 0.55 * I + 0.45 * I2
+
+    # Normalize to [0, Q]
+    I -= I.min()
+    I /= (I.max() + 1e-12)
+    img = np.round(I * Q).astype(np.uint16)
+    return img
+
+
+# =============================================================================
+# Encode / Decode (vectorized)
+# =============================================================================
+
+def encode_image_asmuth_bloom_fast(
+    img_u16: np.ndarray,
+    p0: int,
+    primes: List[int],
+    eps_h: int,
+    perm: List[int],
+    random_bits: int = 128,
+    seed: int = 1337,
+) -> List[np.ndarray]:
+    """
+    Encode each pixel s into n shards:
+        s_shift = s + eps_h        (ensures non-zero)
+        s' = s_shift + r*p0        (random lift, secrecy)
+        share_i = s' mod p_i
+
+    r is generated as 64-bit randomness per pixel (fast). We only ever need r mod p_i.
+
+    Returns routed shards (physical order) as uint16 arrays.
+    """
+    assert img_u16.dtype == np.uint16
+    H, W = img_u16.shape
+    n = len(primes)
+
+    rng = np.random.default_rng(seed)
+
+    # 64-bit randomness r (per pixel)
+    # IMPORTANT: For k-of-n decoding to be uniquely correct, we need s' = s_shift + r*p0 < M_k.
+    # For the primes used here, even the maximum uint64 r keeps s' well below M_k, so reconstruction is exact.
+    r = rng.integers(0, 2**64, size=(H, W), dtype=np.uint64)
+
+    # s_shift fits in < p0 and < each p_i
+    s_shift = img_u16.astype(np.uint64) + np.uint64(eps_h)
+
+    shares_by_prime_index: List[np.ndarray] = []
+
+    for p in primes:
+        p_int = int(p)
+        p0_int = int(p0)
+        p0_mod_pi = p0_int % p_int
+
+        r_mod_p = r % np.uint64(p_int)
+
+        # share = (s_shift + r_mod_p * (p0 mod p)) mod p
+        share = (s_shift + (r_mod_p * np.uint64(p0_mod_pi)) % np.uint64(p_int)) % np.uint64(p_int)
+        shares_by_prime_index.append(share.astype(np.uint32))
+
+    # Route via Φ permutation: physical i holds prime perm[i]
+    routed = [shares_by_prime_index[perm[i]] for i in range(n)]
+    return routed
+
+
+def decode_image_from_k_shards(
+    shards_physical: List[np.ndarray],
+    kept_physical_indices: List[int],
+    p0: int,
+    primes: List[int],
+    eps_h: int,
+    perm: List[int],
+    k: int,
+) -> np.ndarray:
+    """
+    Decode using any k shards:
+      - map physical shards -> corresponding primes via perm
+      - CRT reconstruct s' mod p0 (fast)
+      - s = (s' mod p0) - eps_h
+    """
+    assert len(kept_physical_indices) >= k
+    use_phys = kept_physical_indices[:k]
+
+    prime_indices = [perm[i] for i in use_phys]
+    moduli = [primes[j] for j in prime_indices]
+    residues = [shards_physical[i].astype(np.uint64) for i in use_phys]
+
+    s_shift = crt_reconstruct_mod_p0(residues, moduli, p0)  # equals (s + eps_h) mod p0
+    rec = (s_shift.astype(np.int64) - int(eps_h)) % int(p0)
+
+    # Since original pixels in [0,Q] and Q < p0, this lands back in [0,Q].
+    return rec.astype(np.uint16)
+
+
+# =============================================================================
+# Benchmark
+# =============================================================================
+
+def run_image_reconstruction_benchmark(
+    H: int = 1024,
+    W: int = 1024,
+    Q: int = 65535,
+    n: int = 10,
+    k: int = 6,
+    max_erasures: Optional[int] = None,
+    trials: int = 20,
+    phi_seed: int = 1337,
+    eps_h: int = 1,
+    image_seed: int = 2026,
+    r_seed: int = 1337,
+    save_prefix: str = "holoraid_v3_hm_6of10",
+) -> Dict[str, object]:
+    if max_erasures is None:
+        max_erasures = n - k
+
+    print("═" * 80)
+    print("HoloRAID v3.0 (HyperMorphic Gearbox) — Image Reconstruction Benchmark")
+    print("═" * 80)
+
+    # Ψ primes
+    p0, primes = psi_prime_schedule(Q=Q, n=n)
+    ok, Mk_1, Mk = asmuth_bloom_condition(p0, primes, k)
+    if not ok:
+        raise RuntimeError("Asmuth–Bloom condition failed for generated primes (unexpected).")
+
+    # Φ routing
+    perm, inv = phi_route_perm(phi_seed, n)
+
+    print("HyperMorphic Gearbox")
+    print(f"  Q={Q}, n={n}, k={k}")
+    print(f"  ε_h={eps_h}, Φ(seed)={phi_seed}")
+    print(f"  shadow prime p0={p0} (must be > Q)")
+    print(f"  sharing primes={primes}")
+    print(f"  AB condition: p0*Mk-1 < Mk  →  {p0*Mk_1} < {Mk}  ✓")
+    print(f"  route_perm={perm}")
+    print()
+
+    # Generate image
+    img = generate_ultra_image(H, W, Q, seed=image_seed)
+
+    # Encode once (same shards for all erasure trials, deterministic r via seed)
+    t0 = time.perf_counter()
+    shards = encode_image_asmuth_bloom_fast(
+        img, p0=p0, primes=primes, eps_h=eps_h, perm=perm, seed=r_seed
+    )
+    t_enc = time.perf_counter() - t0
+
+    shard_min = int(np.min(shards[0]))
+    shard_max = int(np.max(shards[0]))
+
+    print(f"Encoded image {H}x{W} into {n} shards in {t_enc:.3f}s")
+    print(f"Shard dtype={shards[0].dtype}, shard value range ~ [{shard_min}, {shard_max}]")
+    print("")
+
+    rng = np.random.default_rng(999)
+    perfect = 0
+    total = 0
+    decode_times = []
+
+    # Try a quick deterministic "no erasures" pass for sanity
+    kept = list(range(n))
+    rec0 = decode_image_from_k_shards(
+        shards, kept_physical_indices=kept, p0=p0, primes=primes, eps_h=eps_h, perm=perm, k=k
+    )
+    diff0 = np.abs(rec0.astype(np.int32) - img.astype(np.int32))
+    if np.array_equal(rec0, img):
+        print("PASS")
+        print(f"  kept indices: {kept}")
+        print(f"  max abs diff: {int(diff0.max())}")
+    else:
+        print("FAIL")
+        print(f"  kept indices: {kept}")
+        print(f"  max abs diff: {int(diff0.max())}")
+        raise AssertionError("Reconstruction was not bit-perfect (no erasures).")
+
+    print("─" * 80)
+
+    for _ in range(trials):
+        # test erasures 0..max_erasures in each trial
+        for e in range(max_erasures + 1):
+            total += 1
+
+            survivors = list(range(n))
+            if e > 0:
+                erased = rng.choice(survivors, size=e, replace=False).tolist()
+                survivors = [i for i in survivors if i not in erased]
+
+            # Use any k shards among survivors (take first k after shuffle)
+            rng.shuffle(survivors)
+            kept = survivors[:k]
+
+            t1 = time.perf_counter()
+            rec = decode_image_from_k_shards(
+                shards, kept_physical_indices=kept, p0=p0, primes=primes, eps_h=eps_h, perm=perm, k=k
+            )
+            dt = time.perf_counter() - t1
+            decode_times.append(dt)
+
+            if np.array_equal(rec, img):
+                perfect += 1
+            else:
+                # Show a useful debug summary and hard fail
+                diff = np.abs(rec.astype(np.int32) - img.astype(np.int32))
+                print("FAIL")
+                print(f"  erasures: {e}")
+                print(f"  kept indices: {kept}")
+                print(f"  max abs diff: {int(diff.max())}")
+                raise AssertionError("Reconstruction was not bit-perfect.")
+
+    decode_times = np.array(decode_times, dtype=np.float64)
+    print(f"Trials: {trials}")
+    print(f"Max erasures tested: {max_erasures} (n={n}, k={k}, so n-k={n-k})")
+    print(f"Perfect reconstructions: {perfect}/{total} ({100.0*perfect/total:.1f}%)")
+    print(f"Decode time: mean={decode_times.mean():.4f}s, p95={np.quantile(decode_times, 0.95):.4f}s")
+    print("─" * 80)
+
+    # Visualize: original and a reconstruction under max erasures
+    # pick one max-erasure case
+    e = max_erasures
+    survivors = list(range(n))
+    if e > 0:
+        erased = rng.choice(survivors, size=e, replace=False).tolist()
+        survivors = [i for i in survivors if i not in erased]
+    rng.shuffle(survivors)
+    kept = survivors[:k]
+    rec = decode_image_from_k_shards(shards, kept, p0=p0, primes=primes, eps_h=eps_h, perm=perm, k=k)
+
+    # Save images (8-bit preview for viewing)
+    def to_u8(im16: np.ndarray) -> np.ndarray:
+        return (im16.astype(np.float32) / float(Q) * 255.0).clip(0, 255).astype(np.uint8)
+
+    preview = to_u8(img)
+    preview_rec = to_u8(rec)
+    preview_diff = np.abs(preview_rec.astype(np.int16) - preview.astype(np.int16)).astype(np.uint8)
+
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 3, 1)
+    plt.title("Original (preview)")
+    plt.imshow(preview, cmap="gray", vmin=0, vmax=255)
+    plt.axis("off")
+
+    plt.subplot(1, 3, 2)
+    plt.title(f"Reconstruction (erasures={e})")
+    plt.imshow(preview_rec, cmap="gray", vmin=0, vmax=255)
+    plt.axis("off")
+
+    plt.subplot(1, 3, 3)
+    plt.title("Abs diff (preview)")
+    plt.imshow(preview_diff, cmap="gray", vmin=0, vmax=255)
+    plt.axis("off")
+
+    plt.tight_layout()
+    out_png = f"{save_prefix}_preview.png"
+    plt.savefig(out_png, dpi=160, bbox_inches="tight")
+    plt.show()
+    print(f"Saved preview figure: {out_png}")
+
+    return {
+        "Q": Q,
+        "n": n,
+        "k": k,
+        "eps_h": eps_h,
+        "phi_seed": phi_seed,
+        "p0": p0,
+        "primes": primes,
+        "route_perm": perm,
+        "encode_time_s": t_enc,
+        "trials": trials,
+        "max_erasures": max_erasures,
+        "perfect": perfect,
+        "total": total,
+        "decode_mean_s": float(decode_times.mean()),
+        "decode_p95_s": float(np.quantile(decode_times, 0.95)),
+        "preview_png": out_png,
+    }
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+if __name__ == "__main__":
+    import time
+    results = run_image_reconstruction_benchmark(
+        H=1024, W=1024,
+        n=10, k=6,
+        trials=10,
+        phi_seed=1337,
+        eps_h=1,
+        image_seed=2026,
+        r_seed=1337,
+    )
+    print("\nRESULTS:", results)
+
+
+
+
+════════════════════════════════════════════════════════════════════════════════
+HoloRAID v3.0 (HyperMorphic Gearbox) — Image Reconstruction Benchmark
+════════════════════════════════════════════════════════════════════════════════
+HyperMorphic Gearbox
+  Q=65535, n=10, k=6
+  ε_h=1, Φ(seed)=1337
+  shadow prime p0=65537 (must be > Q)
+  sharing primes=[65539, 65543, 65551, 65557, 65563, 65579, 65581, 65587, 65599, 65609]
+  AB condition: p0*Mk-1 < Mk  →  79317660128253148781891860909 < 79368491593309325174598873103  ✓
+  route_perm=[7, 6, 3, 5, 2, 8, 4, 9, 0, 1]
+
+Encoded image 1024x1024 into 10 shards in 0.781s
+Shard dtype=uint32, shard value range ~ [0, 65586]
+
+PASS
+  kept indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  max abs diff: 0
+────────────────────────────────────────────────────────────────────────────────
+Trials: 10
+Max erasures tested: 4 (n=10, k=6, so n-k=4)
+Perfect reconstructions: 50/50 (100.0%)
+Decode time: mean=1.4746s, p95=2.6732s
+────────────────────────────────────────────────────────────────────────────────
+
+Saved preview figure: holoraid_v3_hm_6of10_preview.png
+
+RESULTS: {'Q': 65535, 'n': 10, 'k': 6, 'eps_h': 1, 'phi_seed': 1337, 'p0': 65537, 'primes': [65539, 65543, 65551, 65557, 65563, 65579, 65581, 65587, 65599, 65609], 'route_perm': [7, 6, 3, 5, 2, 8, 4, 9, 0, 1], 'encode_time_s': 0.7812341849999029, 'trials': 10, 'max_erasures': 4, 'perfect': 50, 'total': 50, 'decode_mean_s': 1.4746099692999997, 'decode_p95_s': 2.673230966949813, 'preview_png': 'holoraid_v3_hm_6of10_preview.png'}
